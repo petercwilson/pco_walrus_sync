@@ -11,101 +11,110 @@ PC_APP_ID     = "ef6859b2d409c09b0de1df2788d4551ff10d01ae348e079b207cb58fc96ae98
 PC_SECRET     = "pco_pat_c99952c219805b5ec88f2c72564e39931a310fcf7620f7f302015b05f35ea77ed2910211"
 PLANNING_HOST = "https://api.planningcenteronline.com/services/v2"
 
-MIDI_OUTPUT   = "weekly_setlist.mid"
-MIDI_CHANNEL  = 0   # Most devices use channel 0 or 1
-PROGRAM_START = 0   # Program Change starting index
+MIDI_OUTPUT = "weekly_setlist_with_meta.mid"
+MIDI_CHANNEL = 0
 
-# ========== HELPERS ==========
-
-def auth_header(app_id, secret):
-    token = f"{app_id}:{secret}"
+def auth_header():
+    token = f"{PC_APP_ID}:{PC_SECRET}"
     token_b64 = base64.b64encode(token.encode()).decode()
     return {"Authorization": f"Basic {token_b64}"}
 
 def next_sunday(date):
-    """Return the next upcoming Sunday from a given date."""
     return date + relativedelta(weekday=SU(+1))
 
-# ========== 1. FETCH NEXT SUNDAY PLAN ==========
+# ===== FETCH PLAN & METADATA =====
 
-def fetch_next_sunday_plan():
-    # 1. Find the upcoming Sunday date in YYYY-MM-DD
-    today   = datetime.utcnow().date()
-    sunday  = next_sunday(today)
-    date_str = sunday.strftime("%Y-%m-%d")
+def fetch_plan_songs_with_meta():
+    today = datetime.utcnow().date()
+    sunday = next_sunday(today).strftime("%Y-%m-%d")
 
-    # 2. Get all service types
-    headers = auth_header(PC_APP_ID, PC_SECRET)
-    r = requests.get(f"{PLANNING_HOST}/service_types", headers=headers)
-    r.raise_for_status()
-    service_types = r.json()["data"]
+    headers = auth_header()
 
-    # 3. Pick one service type (customize logic if you have many)
-    svc_type_id = service_types[0]["id"]
+    # fetch service types
+    svc_resp = requests.get(f"{BASE_URL}/service_types", headers=headers)
+    svc_resp.raise_for_status()
+    svc_types = svc_resp.json()["data"]
+    if not svc_types:
+        return []
 
-    # 4. Get plans for the Sunday date
-    params = {"filter[date]": date_str}
-    r = requests.get(
-        f"{PLANNING_HOST}/service_types/{svc_type_id}/plans",
+    svc_id = svc_types[0]["id"]
+
+    # fetch plans for upcoming Sunday
+    params = {"filter[date]": sunday}
+    plans_resp = requests.get(
+        f"{BASE_URL}/service_types/{svc_id}/plans",
         headers=headers,
-        params=params
+        params=params,
     )
-    r.raise_for_status()
-    plans = r.json()["data"]
+    plans_resp.raise_for_status()
+    plans = plans_resp.json()["data"]
     if not plans:
-        print("No service plan found for", date_str)
         return []
 
     plan_id = plans[0]["id"]
 
-    # 5. Fetch items for that plan
-    r = requests.get(
-        f"{PLANNING_HOST}/service_types/{svc_type_id}/plans/{plan_id}/items",
-        headers=headers
+    # fetch items and include song/arrangement/key relationships
+    items_resp = requests.get(
+        f"{BASE_URL}/service_types/{svc_id}/plans/{plan_id}/items",
+        headers=headers,
+        params={"include": "arrangement,key,song"},
     )
-    r.raise_for_status()
-    items = r.json()["data"]
+    items_resp.raise_for_status()
+    data = items_resp.json()
 
-    # 6. Grab songs in order
-    songs = []
-    for item in items:
-        item_type = item["attributes"]["item_type"]
-        if item_type.lower() == "song":
+    # map included resources by type/id
+    included = {f'{item["type"]}:{item["id"]}': item for item in data.get("included", [])}
+
+    songs_meta = []
+    for item in data["data"]:
+        if item["attributes"]["item_type"].lower() == "song":
             title = item["attributes"]["title"]
-            songs.append(title)
 
-    return songs
+            # get arrangement and key
+            arr_rel = item["relationships"].get("arrangement")
+            key_rel = item["relationships"].get("key")
 
-# ========== 2. GENERATE MIDI FILE ==========
+            bpm = meter = key_name = None
 
-def create_midi_for_songs(songs):
-    midi = MIDIFile(1)            # One track
-    track = 0
-    time  = 0
+            if arr_rel and arr_rel["data"]:
+                arr = included.get(f'arrangements:{arr_rel["data"]["id"]}')
+                if arr:
+                    bpm = arr["attributes"].get("bpm")
+                    meter = arr["attributes"].get("meter")
+
+            if key_rel and key_rel["data"]:
+                key = included.get(f'keys:{key_rel["data"]["id"]}')
+                if key:
+                    key_name = key["attributes"].get("name")
+
+            songs_meta.append({
+                "title": title,
+                "bpm": bpm,
+                "meter": meter,
+                "key": key_name,
+            })
+
+    return songs_meta
+
+def create_midi(songs_meta):
+    midi = MIDIFile(1)
+    track, time = 0, 0
     midi.addTrackName(track, time, "Service Setlist")
-    midi.addTempo(track, time, 120)  # Default; optional
+    midi.addTempo(track, time, 120)
 
-    for i, song in enumerate(songs):
-        # Send a Program Change event
-        program_number = PROGRAM_START + i
-        midi.addProgramChange(track, MIDI_CHANNEL, time, program_number)
-        time += 1  # Advance to next tick
+    for i, song in enumerate(songs_meta):
+        midi.addProgramChange(track, MIDI_CHANNEL, time, i)
+        meta_info = f"{song['title']} | BPM: {song['bpm']} | TS: {song['meter']} | Key: {song['key']}"
+        print(meta_info)
+        time += 1
 
-        print(f"MIDI PC {program_number} -> {song}")
-
-    # Write the file
-    with open(MIDI_OUTPUT, "wb") as out:
-        midi.writeFile(out)
-    print(f"Saved MIDI file: {MIDI_OUTPUT}")
-
-# ========== MAIN ==========
+    with open(MIDI_OUTPUT, "wb") as f:
+        midi.writeFile(f)
+    print("MIDI generated:", MIDI_OUTPUT)
 
 if __name__ == "__main__":
-    print("Fetching next Sunday’s service plan…")
-    songs = fetch_next_sunday_plan()
-    if not songs:
-        print("No songs found — aborting MIDI file creation.")
+    songs_meta = fetch_plan_songs_with_meta()
+    if songs_meta:
+        create_midi(songs_meta)
     else:
-        print("Songs:", songs)
-        print("Creating MIDI...")
-        create_midi_for_songs(songs)
+        print("No songs found for upcoming Sunday.")
